@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="res_config_settings_view_form_inherit_adset" model="ir.ui.view">
+        <field name="name">res.config.settings.view.form.inherit.adset</field>
+        <field name="model">res.config.settings</field>
+        <field name="inherit_id" ref="crm.res_config_settings_view_form"/>
+        <field name="arch" type="xml">
+            <xpath expr="//app[@name='crm']" position="inside">
+                <block title="إعدادات الـ Webhook وتكامل المجموعات الإعلانية" id="adset_webhook_setting">
+                    <setting help="استخدم هذا الرابط ومفتاح الأمان لربط منصات الإعلانات (Meta / Google / Zapier) مع Odoo CRM مباشرة.">
+                        <div class="content-group">
+                            <div class="row mt16">
+                                <label for="crm_webhook_url" string="Webhook Receiver URL" class="col-lg-3 o_light_label"/>
+                                <field name="crm_webhook_url" widget="CopyClipboardChar" class="col-lg-9"/>
+                            </div>
+                            <div class="row mt8">
+                                <label for="crm_webhook_secret" string="Webhook Secret Key" class="col-lg-3 o_light_label"/>
+                                <div class="col-lg-9 d-flex gap-2">
+                                    <field name="crm_webhook_secret" placeholder="انقر على زر التوليد بالأسفل"/>
+                                    <button name="action_generate_webhook_secret" type="object" string="توليد مفتاح جديد" class="btn btn-secondary btn-sm"/>
+                                </div>
+                            </div>
+                        </div>
+                    </setting>
+                </block>
+            </xpath>
+        </field>
+    </record>
+</odoo>

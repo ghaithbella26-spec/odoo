@@ -827,9 +827,9 @@ class PoFileReader:
                 continue
 
             # in case of moduleS keep only the first
-            match = re.match(r"(module[s]?): (\w+)", entry.comment)
-            _, module = match.groups()
-            comments = "\n".join([c for c in entry.comment.split('\n') if not c.startswith('module:')])
+            match = re.match(r"(module[s]?): (\w+)", entry.comment) if entry.comment else None
+            module = match.group(2) if match else ''
+            comments = "\n".join([c for c in (entry.comment or '').split('\n') if not c.startswith('module:')])
             source = entry.msgid
             translation = entry.msgstr
             found_code_occurrence = False

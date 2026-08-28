@@ -1,0 +1,9 @@
+# -*- coding: utf-8 -*-
+from odoo import fields, models
+
+
+class CrmLead(models.Model):
+    _inherit = 'crm.lead'
+
+    adset_id = fields.Many2one('crm.adset', string='Ad Set', ondelete='set null', index=True,
+                              help='The advertising ad set that generated this lead')
