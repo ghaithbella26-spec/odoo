@@ -50,7 +50,7 @@ class AccountEdiProxyClientUser(models.Model):
         if not proxy_type:
             self.ensure_one()
             proxy_type = self.proxy_type
-        return f"/api/{proxy_type}/{endpoint}"
+        return f"/api/{proxy_type}/{endpoint.lstrip('/')}"
 
     @handle_demo
     def _call_peppol_proxy(self, endpoint, params=None):
@@ -183,6 +183,14 @@ class AccountEdiProxyClientUser(models.Model):
         attachment.write({'res_model': 'account.move', 'res_id': move.id})
         return move
 
+    def _get_type_code(self, attachment):
+        try:
+            xml_tree = etree.fromstring(attachment.raw)
+        except etree.XMLSyntaxError:
+            xml_tree = etree.fromstring(REMOVE_EMBEDDED_DOCUMENT_BINARY_OBJECT_RE.sub(b'', attachment.raw))
+            _logger.warning("The Peppol XML file was trimmed after huge node tree error for attachment ID %s", attachment.id)
+        return xml_tree.findtext('.//{*}InvoiceTypeCode') or xml_tree.findtext('.//{*}CreditNoteTypeCode')
+
     def _peppol_get_import_journal_and_move_type(self, attachment):
         # Self-billed invoices are invoices which your customer creates on your behalf and sends you via Peppol.
         # In this case, the invoice needs to be created as an out_invoice in a sale journal.
@@ -190,35 +198,16 @@ class AccountEdiProxyClientUser(models.Model):
         journal = self.company_id.peppol_purchase_journal_id
         move_type = 'in_invoice'
         error_msg = "The Peppol XML file is invalid or empty for attachment ID %s"
-
         try:
-            xml_tree = etree.fromstring(attachment.raw)
-        except etree.XMLSyntaxError:
-            try:
-                xml_tree = etree.fromstring(REMOVE_EMBEDDED_DOCUMENT_BINARY_OBJECT_RE.sub(b'', attachment.raw))
-            except (etree.XMLSyntaxError, ValueError):
-                _logger.exception(error_msg, attachment.id)
-                return journal, move_type
-            _logger.warning("The Peppol XML file was trimmed after huge node tree error for attachment ID %s", attachment.id)
-        except ValueError:
+            type_code = self._get_type_code(attachment)
+        except (etree.XMLSyntaxError, ValueError):
             _logger.exception(error_msg, attachment.id)
             return journal, move_type
 
-        invoice_type_code = xml_tree.findtext('.//{*}InvoiceTypeCode')
-        credit_note_type_code = xml_tree.findtext('.//{*}CreditNoteTypeCode')
-        if invoice_type_code in ['389', '527'] or credit_note_type_code == '261':
-            # 329/527: Self-billing invoice; 261: Self-billing credit note
-            sale_journal_domain = [
-                *self.env['account.journal']._check_company_domain(self.company_id),
-                ('type', '=', 'sale'),
-            ]
-            journal = self.env['account.journal'].search(
-                [*sale_journal_domain, ('is_self_billing', '=', True)],
-                limit=1,
-            )
-            if not journal:
-                journal = self.env['account.journal'].search(sale_journal_domain, limit=1)
-            move_type = 'out_invoice' if invoice_type_code else 'out_refund'
+        if type_code in ['389', '527', '261']:
+            # 389/527: Self-billing invoice; 261: Self-billing credit note
+            journal = self._peppol_get_import_sale_journal(self.company_id)
+            move_type = 'out_invoice' if type_code in ['389', '527'] else 'out_refund'
         return journal, move_type
 
     def _peppol_get_duplicate_message_uuids(self, message_uuids):
@@ -255,23 +244,31 @@ class AccountEdiProxyClientUser(models.Model):
                     'Error while receiving the document from Peppol Proxy: %s', e.message)
                 continue
 
-            message_uuids = [
-                message['uuid']
-                for message in messages.get('messages', [])
+            received_messages = messages.get('messages', [])
+            # Edge case: self-addressed messages (sender == receiver), i.e. a company genuinely
+            # invoicing itself. The outgoing invoice already carries the message UUID, so the
+            # duplicate check would wrongly discard the incoming document.
+            # Exclude those messages from the check so the vendor bill can still be created.
+            uuids_to_check = [
+                message['uuid'] for message in received_messages
+                if message.get('sender') and message['sender'] != message['receiver']
             ]
-            # remove the duplicates
-            if duplicate_message_uuids := list(edi_user._peppol_get_duplicate_message_uuids(message_uuids)):
-                message_uuids = list(set(message_uuids) - set(duplicate_message_uuids))
-                # acknowledge the duplicates on IAP side.
+            # Acknowledge the duplicates on IAP side.
+            if duplicate_message_uuids := edi_user._peppol_get_duplicate_message_uuids(uuids_to_check):
                 edi_user._call_peppol_proxy(
                     endpoint=edi_user._get_peppol_proxy_endpoint('1/ack'),
-                    params={'message_uuids': duplicate_message_uuids},
+                    params={'message_uuids': list(duplicate_message_uuids)},
                 )
                 _logger.info(
                     "Messages with UUID %s could not be imported because they are identified as duplicates",
                     ', '.join(duplicate_message_uuids)
                 )
 
+            # Remove the duplicates
+            message_uuids = [
+                message['uuid'] for message in received_messages
+                if message['uuid'] not in duplicate_message_uuids
+            ]
             if not message_uuids:
                 continue
 
@@ -305,6 +302,15 @@ class AccountEdiProxyClientUser(models.Model):
         enc_key = content["enc_key"]
         document_content = content["document"]
         return self._decrypt_data(document_content, enc_key)
+
+    def _peppol_get_import_sale_journal(self, company):
+        return self.env['account.journal'].search(
+            [
+                *self.env['account.journal']._check_company_domain(company),
+                ('type', '=', 'sale'),
+            ],
+            limit=1,
+        )
 
     def _peppol_process_new_messages(self, messages):
         self.ensure_one()
@@ -381,8 +387,7 @@ class AccountEdiProxyClientUser(models.Model):
                     # thrown when the IAP is still processing the message
                     continue
                 move.peppol_move_state = 'error'
-                error = content['error']
-                move._message_log(body=render_peppol_errors(move, error.get('data', {}).get('message') or error['message']))
+                move._message_log(body=self._peppol_get_message_status_error_body(move, content['error']))
                 processed_message_uuids.append(uuid)
                 continue
 
@@ -392,8 +397,7 @@ class AccountEdiProxyClientUser(models.Model):
         return processed_message_uuids
 
     def _peppol_get_message_status_error_body(self, move, error):
-        # DEPRECATED, TO BE REMOVED IN MASTER
-        pass
+        return render_peppol_errors(move, error)
 
     def _peppol_get_message_status_update_body(self, move, content):
         self.ensure_one()

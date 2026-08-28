@@ -10,6 +10,7 @@ from odoo.tools.misc import format_date
 from odoo.tools.translate import LazyTranslate
 
 from odoo.addons.account_edi_proxy_client.models.account_edi_proxy_user import AccountEdiProxyError
+from odoo.addons.account.models.mail_message import bypass_token
 from odoo.addons.l10n_fr_pdp.models.account_peppol_response import PEPPOL_TO_PDP_STATUS, PDP_STATUSES
 from odoo.addons.l10n_fr_pdp.tools.demo_utils import handle_demo
 from odoo.addons.l10n_fr_pdp.utils.cdar import _parse_datetime_node as _parse_cdar_datetime_node
@@ -28,11 +29,14 @@ CDAR_NSMAP = MappingProxyType({
 
 PROCESS_CONDITION_CODE_TO_RESPONSE_CODE_PDP = MappingProxyType({
     '200': 'submitted',  # PA-S (sending platform)
+    '201': 'sent',  # PA-S
     '202': 'AB',  # PA-R (receiving platform)
     '203': 'made_available',  # PA-R
     '204': 'in_hand',  # R (receiver)
     '205': 'AP',  # R
     '207': 'contested',  # R
+    '208': 'suspended',  # R
+    '209': 'completed',  # S
     '210': 'refused',  # R
     '211': 'payment_sent',  # R
     '212': 'PD',  # S (sender)
@@ -420,8 +424,11 @@ class AccountEdiProxyClientUser(models.Model):
             if not origin_move:
                 _logger.warning('The French e-invoicing response with UUID %s could not be imported: Original journal entry (UUID %s) not found.', uid, origin_uuid)
                 continue
-            if self._pdp_import_incoming_response(uid, content, origin_move[:1]):
-                processed_uuids.append(uid)
+            try:
+                self._pdp_import_incoming_response(uid, content, origin_move[:1])
+            except Exception:  # noqa: BLE001
+                _logger.exception('Error while processing the PDP Response with uid %s', uid)
+            processed_uuids.append(uid)
 
         return other_uuids + processed_uuids, moves
 
@@ -446,7 +453,11 @@ class AccountEdiProxyClientUser(models.Model):
                 if not origin_uuid or not origin_move:
                     _logger.warning('[Flow 1] The tax extract from the PPF with UUID %s could not be imported: Original journal entry (UUID %s) not found.', uid, origin_uuid)
                     continue
-                processed_messages[uid] = self._pdp_import_tax_extract(uid, content, origin_move[:1])
+
+                try:
+                    processed_messages[uid] = self._pdp_import_tax_extract(uid, content, origin_move[:1])
+                except Exception:  # noqa: BLE001
+                    _logger.exception('Error while processing the PPF message tax_extract with uid %s', uid)
             elif content['document_type'] == 'CrossDomainAcknowledgementAndResponse' and flow_number in ('1', '6'):
                 processed_messages[uid] = self.env['account.peppol.response']
                 origin_uuid = content['origin_peppol_message_uuid']
@@ -456,11 +467,20 @@ class AccountEdiProxyClientUser(models.Model):
                     _logger.warning('[Flow %s] The %s response from the PPF with UUID %s could not be imported: Original journal entry (UUID %s) not found.', flow_number, flow_description, uid, origin_uuid)
                     continue
                 if content['direction'] == 'outgoing':
-                    processed_messages[uid] = self._pdp_import_outgoing_response(uid, content, origin_move[:1])
+                    try:
+                        processed_messages[uid] = self._pdp_import_outgoing_response(uid, content, origin_move[:1])
+                    except Exception:  # noqa: BLE001
+                        _logger.exception('Error while processing the PPF message response with uid %s', uid)
                 else:
-                    processed_messages[uid] = self._pdp_import_incoming_response(uid, content, origin_move[:1])
+                    try:
+                        processed_messages[uid] = self._pdp_import_incoming_response(uid, content, origin_move[:1])
+                    except Exception:  # noqa: BLE001
+                        _logger.exception('Error while processing the PPF message response with uid %s', uid)
             elif content['document_type'] == 'CrossDomainAcknowledgementAndResponse' and flow_number == '10':
-                self._pdp_import_flow_10_response(uid, content)
+                try:
+                    self._pdp_import_flow_10_response(uid, content)
+                except Exception:  # noqa: BLE001
+                    _logger.exception('Error while processing the PPF message report response with uid %s', uid)
                 processed_messages[uid] = True
 
         return processed_messages
@@ -739,7 +759,8 @@ class AccountEdiProxyClientUser(models.Model):
             return
 
         if message:
-            message.body = body
+            # replace the message that was just created to avoid giving conflicting states
+            message.with_context(bypass_audit=bypass_token).body = body
         else:
             message = move._message_log(body=body)
         chatter_messages[move] = (message, logged_details)
@@ -819,6 +840,14 @@ class AccountEdiProxyClientUser(models.Model):
         if content['document_type'] == 'Factur-X':
             return "pdf", "application/pdf"
         return super()._peppol_get_filetype(content)
+
+    def _get_type_code(self, attachment):
+        # Factur-X format embeds the XML in a PDF file.
+        if attachment.mimetype == 'application/pdf':
+            embedded_files = attachment._unwrap_edi_attachments()
+            xml_tree = next(filter(lambda file: file['type'] == 'xml', embedded_files))['xml_tree']
+            return xml_tree.findtext('.//{*}ExchangedDocument/{*}TypeCode')
+        return super()._get_type_code(attachment)
 
     def _pdp_send_lifecycles(self, batch_size=None):
         job_count = batch_size or BATCH_SIZE
